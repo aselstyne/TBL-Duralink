@@ -6,7 +6,7 @@
 #define CE_PIN 2  // Example pin number for CE (Chip Select)
 #define CD_PIN 3  // Example pin number for C/D (Data/Command)
 #define RESET_PIN 4  // Example pin number for Reset
-// Initialize display (example with T6963C controller)
+// Initialize display
 U8G2_T6963_240X128_F_8080 u8g2(U8G2_R0, /* data=*/ 5,6,7,8,9,10,11,12,  /* enable=*/ WR_PIN, /* cs=*/ CE_PIN, /* dc=*/ CD_PIN, /* reset=*/ RESET_PIN);
 
 // Input pin mappings
@@ -597,7 +597,6 @@ void checkErrors(int cat, int dur) {
   if (cat>dur+800 && dur>600 && error < 4){
     error = 6; //catalyst is pressurized higher than durables
   }
-  
 
   // Overpressurization is the most important error, and is always checked
   // Checked last as it takes precedent over all other errors

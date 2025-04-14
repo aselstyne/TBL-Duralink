@@ -12,6 +12,7 @@ U8G2_T6963_240X128_F_8080 u8g2(U8G2_R0, /* data=*/ 5,6,7,8,9,10,11,12,  /* enabl
 // Input pin mappings
 const uint8_t DUR_PIN = A0;
 const uint8_t CAT_PIN = A1;
+const uint8_t FLOW_PIN = 16;
 
 // Output pin mappings
 const uint8_t SOLENOID_PIN = 21;
@@ -33,12 +34,20 @@ unsigned long recStart = 0;
 unsigned long lastV = -900000;
 unsigned long lastRec = 0;
 unsigned long engageTime = 0;
+unsigned long bypassCooldownStart = 0;
 // Circular queue like-structures which both record previous pressure values
 const uint8_t REC_LEN = 50; // Number of previous values to store to make, one value is recorded every 100 ms
 int catRecs[REC_LEN]; 
 int durRecs[REC_LEN];
 uint8_t numRecs = 0;
 uint8_t head = 0;
+
+// Pulse measurement variables for acetone flow
+unsigned long lastChangeTime = 0;
+unsigned long pulseLowTime = 0;
+unsigned long pulseHighTime = 0;
+bool lastState = LOW;
+int numPulses = 0;
 
 // Bits for logo; you'll want to collapse these, typically.
 const uint8_t tbldLogo_bits[] PROGMEM = {
@@ -434,7 +443,8 @@ static const char* messages[] = { // Max line width is approximately 31 characte
   "Catalyst overpressurization!\nDo not exceed 2300psi.\nBypass, then repressurize.\nhelp.tbldurables.com/pressure", //Error 4: overpressurization failsafe
   "Catalyst pressure too low!\nCat. must be pressurized\neven when flushing or\ncolor changing. Dump pressures.", // Error 5: BP mode, cat < 300, dur > 500
   "Catalyst pressure too high!\nCatalyst pressure should\nbe less than durables.\nBypass, then repressurize.", // Error 6: SP mode, cat>dur+200
-  "Catalyst pressure unstable!\nPurge gun + dump pressures.\nUse QR code or visit\nhelp.tbldurables.com/catsupply" // Error 7: catalyst experiencing drastic swings, quick V's
+  "Catalyst pressure unstable!\nPurge gun + dump pressures.\nUse QR code or visit\nhelp.tbldurables.com/catsupply", // Error 7: catalyst experiencing drastic swings, quick V's
+  "Durables in acetone hose!\nNever pull trigger if purge\nvalve open. Bypass,\nPURGE NOW!, then repressurize." // Error 8: Acetone flow sensor
 };
 
 int getCatIndex(int index){
@@ -477,13 +487,20 @@ void bypassUpdate(int cat, int dur) {
     }
   } else {
     if (cat < 300 && dur < 500){
-      if (error != 7 || (error == 7 && millis() - engageTime > 32000)){
-        if (error != 7) {
+      // 1 second cooldown on the failsafe. Must site below threshold for 1 second
+      if (bypassCooldownStart == 0){
+        bypassCooldownStart = millis();
+      }
+      unsigned long timeDelta = millis() - engageTime; 
+      if (((error != 7 && error != 8) || ((error == 7 && timeDelta > 32000) || (error == 8 && timeDelta > 180000))) && (millis() - bypassCooldownStart > 1000)){
+        if (error != 7 && error != 8) {
           error = 0; // Clear errors once pressure is dumped
         }
         bypassMode = 0;
         resetRecs();
       }
+    } else {
+      bypassCooldownStart = 0;
     }
   }
 }
@@ -493,7 +510,8 @@ void errorEngage(){
   if (error > 3){ // "Errors" 1 to 3 are warning states; no shutoff required
     digitalWrite(SOLENOID_PIN, HIGH); // Turn the shutoff on
     // For error 7, we have to stop the error from immediately being cleared
-    if (error == 7 && millis() - engageTime > 30000){
+    unsigned long timeDelta = millis() - engageTime;
+    if ((error == 7 && timeDelta > 30000) || (error == 8 && timeDelta > 180000)){
       digitalWrite(SOLENOID_PIN, LOW);
     }
   } else
@@ -517,10 +535,19 @@ void checkErrors(int cat, int dur) {
     
     if (cat > 500 && cat < 1700)
       error = 1;
-    else if (cat < 300 && dur < 300 && error != 7)
+    else if (cat < 300 && dur < 300 && error != 7 && error != 8)
       error = 0; // In bypass mode, we can just clear the error if neither of the conditions hold at a particular time
   } else if (bypassMode == 1) {
-    // SPRAY MODE FAILSAFES
+    // SPRAY MODE //
+    ////////// BACKFLOW FAILSAFE //////////
+    if (numPulses >= 5) {  
+      engageTime = millis();
+      error = 8;
+      numPulses = 0;
+    }
+
+
+    //////// REGULAR SYSTEM FAILSAFES ///////////
     if (currTime-lastRec > 100){
       insertVals(cat,dur);
       // Get the minimum value for the catalyst in the recordings
@@ -561,10 +588,9 @@ void checkErrors(int cat, int dur) {
             }
             lastV = currTime;
             resetRecs();
-            Serial.println(lastV);
           }
         }
-        // CHECK 2 and 3 - is catalyst all below 700?
+        // CHECK 2 and 3 - is catalyst all below 500?
         if (allLess){
           // allow data to gather for 3 seconds, with 1 second buffer
           if (recStart == 0){
@@ -654,11 +680,12 @@ void drawMultiLine(int y, int lineHeight, char* str){
 void setup() {
   // Pin setup
   pinMode(SOLENOID_PIN, OUTPUT);
+  pinMode(FLOW_PIN, INPUT);
 
   // Start up libraries
   u8g2.begin();
   Serial.begin(9600);
-  Serial.println("STARTING UP...");
+  Serial.println("TBLD Link - V1.0.1");
 
   // Display boot screen for 5 secs
   u8g2.firstPage();
@@ -680,6 +707,35 @@ void loop() {
   avgCat = avgCat + catPress;
   avgDur = avgDur + durPress;
   numSamples = numSamples + 1;
+
+  // Read pulse length
+  bool currentState = digitalRead(FLOW_PIN);
+  unsigned long now = micros();
+  if (currentState == HIGH && lastState == LOW) {
+    pulseLowTime = now - lastChangeTime;
+    lastChangeTime = now;  // Update timestamp
+
+    // Increment count if LOW duration is valid
+    if (30000 < pulseLowTime && pulseLowTime < 350000) {
+      numPulses += 1;
+    } else {
+      numPulses = 0;  // Reset if invalid
+    }
+  }
+
+  // Detect falling edge (HIGH -> LOW) → Measure HIGH duration
+  if (currentState == LOW && lastState == HIGH) {
+    pulseHighTime = now - lastChangeTime;
+    lastChangeTime = now;  // Update timestamp
+
+    // Increment count if HIGH duration is valid
+    if (70000 < pulseHighTime && pulseHighTime < 350000) {
+      numPulses += 1;
+    } else {
+      numPulses = 0;  // Reset if invalid
+    }
+  }
+  lastState = currentState;  // Update state for next loop iteration
 
   // Run Failsafes
   bypassUpdate(catPress, durPress); // Update status into/out of bypass mode; clear error when moving into

@@ -47,7 +47,8 @@ unsigned long lastChangeTime = 0;
 unsigned long pulseLowTime = 0;
 unsigned long pulseHighTime = 0;
 bool lastState = LOW;
-int numPulses = 0;
+uint8_t numPulses = 0;
+uint8_t badOne = 0;
 
 // Bits for logo; you'll want to collapse these, typically.
 const uint8_t tbldLogo_bits[] PROGMEM = {
@@ -540,7 +541,7 @@ void checkErrors(int cat, int dur) {
   } else if (bypassMode == 1) {
     // SPRAY MODE //
     ////////// BACKFLOW FAILSAFE //////////
-    if (numPulses >= 5) {  
+    if (numPulses >= 3) {  
       engageTime = millis();
       error = 8;
       numPulses = 0;
@@ -685,7 +686,7 @@ void setup() {
   // Start up libraries
   u8g2.begin();
   Serial.begin(9600);
-  Serial.println("TBLD Link - V1.0.1");
+  Serial.println("TBLD Link - V1.0.2");
 
   // Display boot screen for 5 secs
   u8g2.firstPage();
@@ -716,10 +717,16 @@ void loop() {
     lastChangeTime = now;  // Update timestamp
 
     // Increment count if LOW duration is valid
-    if (30000 < pulseLowTime && pulseLowTime < 350000) {
+    if (250000 < pulseLowTime && pulseLowTime < 350000) {
       numPulses += 1;
     } else {
-      numPulses = 0;  // Reset if invalid
+      if (numPulses > 0)
+        badOne += 1;
+      // allow for one intermediate spin that is out of the range
+      if (badOne > 1){
+        numPulses = 0; // Reset if two invalid spins detected
+        badOne = 0;
+      }
     }
   }
 
@@ -729,10 +736,16 @@ void loop() {
     lastChangeTime = now;  // Update timestamp
 
     // Increment count if HIGH duration is valid
-    if (70000 < pulseHighTime && pulseHighTime < 350000) {
+    if (250000 < pulseHighTime && pulseHighTime < 350000) {
       numPulses += 1;
     } else {
-      numPulses = 0;  // Reset if invalid
+      if (numPulses > 0)
+        badOne += 1;
+      // allow for one intermediate spin that is out of the range
+      if (badOne > 1){
+        numPulses = 0; // Reset if two invalid spins detected
+        badOne = 0;
+      }
     }
   }
   lastState = currentState;  // Update state for next loop iteration

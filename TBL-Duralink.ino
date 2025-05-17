@@ -12,7 +12,7 @@ U8G2_T6963_240X128_F_8080 u8g2(U8G2_R0, /* data=*/ 5,6,7,8,9,10,11,12,  /* enabl
 // Input pin mappings
 const uint8_t DUR_PIN = A0;
 const uint8_t CAT_PIN = A1;
-const uint8_t FLOW_PIN = 16;
+const uint8_t ACETONE_PIN = A2;
 
 // Output pin mappings
 const uint8_t SOLENOID_PIN = 21;
@@ -24,6 +24,7 @@ static uint8_t error = 0;
 unsigned long lastFrame = 0;
 unsigned long avgCat = 0;
 unsigned long avgDur = 0;
+unsigned long avgAce = 0;
 int numSamples = 0;
 
 
@@ -35,20 +36,15 @@ unsigned long lastV = -900000;
 unsigned long lastRec = 0;
 unsigned long engageTime = 0;
 unsigned long bypassCooldownStart = 0;
+unsigned long timeDelta = 0;
+unsigned long error8Time = 60000; //Error 8 waits 1 minute before turning pump back on
+unsigned long error7Time = 30000; // Error 7 waits 30 seconds before turning pump back on
 // Circular queue like-structures which both record previous pressure values
 const uint8_t REC_LEN = 50; // Number of previous values to store to make, one value is recorded every 100 ms
 int catRecs[REC_LEN]; 
 int durRecs[REC_LEN];
 uint8_t numRecs = 0;
 uint8_t head = 0;
-
-// Pulse measurement variables for acetone flow
-unsigned long lastChangeTime = 0;
-unsigned long pulseLowTime = 0;
-unsigned long pulseHighTime = 0;
-bool lastState = LOW;
-uint8_t numPulses = 0;
-uint8_t badOne = 0;
 
 // Bits for logo; you'll want to collapse these, typically.
 const uint8_t tbldLogo_bits[] PROGMEM = {
@@ -445,7 +441,7 @@ static const char* messages[] = { // Max line width is approximately 31 characte
   "Catalyst pressure too low!\nCat. must be pressurized\neven when flushing or\ncolor changing. Dump pressures.", // Error 5: BP mode, cat < 300, dur > 500
   "Catalyst pressure too high!\nCatalyst pressure should\nbe less than durables.\nBypass, then repressurize.", // Error 6: SP mode, cat>dur+200
   "Catalyst pressure unstable!\nPurge gun + dump pressures.\nUse QR code or visit\nhelp.tbldurables.com/catsupply", // Error 7: catalyst experiencing drastic swings, quick V's
-  "Durables in acetone hose!\nNever pull trigger if purge\nvalve open. Bypass,\nPURGE NOW!, then repressurize." // Error 8: Acetone flow sensor
+  "Durables in acetone hose! Never\npull trigger if purge valve open.\nBypass and then PURGE GUN!" // Error 8: Acetone flow sensor
 };
 
 int getCatIndex(int index){
@@ -492,9 +488,9 @@ void bypassUpdate(int cat, int dur) {
       if (bypassCooldownStart == 0){
         bypassCooldownStart = millis();
       }
-      unsigned long timeDelta = millis() - engageTime; 
-      if (((error != 7 && error != 8) || ((error == 7 && timeDelta > 32000) || (error == 8 && timeDelta > 180000))) && (millis() - bypassCooldownStart > 1000)){
-        if (error != 7 && error != 8) {
+      timeDelta = millis() - engageTime; 
+      if (((error != 7 && error != 8) || ((error == 7 && timeDelta > error7Time+2000) || (error == 8 && timeDelta > error8Time))) && (millis() - bypassCooldownStart > 1000)){
+        if (error != 7) {
           error = 0; // Clear errors once pressure is dumped
         }
         bypassMode = 0;
@@ -512,7 +508,7 @@ void errorEngage(){
     digitalWrite(SOLENOID_PIN, HIGH); // Turn the shutoff on
     // For error 7, we have to stop the error from immediately being cleared
     unsigned long timeDelta = millis() - engageTime;
-    if ((error == 7 && timeDelta > 30000) || (error == 8 && timeDelta > 180000)){
+    if ((error == 7 && timeDelta > error7Time) || (error == 8 && timeDelta > error8Time)){
       digitalWrite(SOLENOID_PIN, LOW);
     }
   } else
@@ -536,18 +532,10 @@ void checkErrors(int cat, int dur) {
     
     if (cat > 500 && cat < 1700)
       error = 1;
-    else if (cat < 300 && dur < 300 && error != 7 && error != 8)
+    else if (cat < 300 && dur < 300 && error != 7 && (error != 8 && timeDelta > error8Time))
       error = 0; // In bypass mode, we can just clear the error if neither of the conditions hold at a particular time
   } else if (bypassMode == 1) {
     // SPRAY MODE //
-    ////////// BACKFLOW FAILSAFE //////////
-    if (numPulses >= 3) {  
-      engageTime = millis();
-      error = 8;
-      numPulses = 0;
-    }
-
-
     //////// REGULAR SYSTEM FAILSAFES ///////////
     if (currTime-lastRec > 100){
       insertVals(cat,dur);
@@ -621,6 +609,7 @@ void checkErrors(int cat, int dur) {
     } 
   }
 
+  // Agnostic error
   if (cat>dur+800 && dur>600 && error < 4){
     error = 6; //catalyst is pressurized higher than durables
   }
@@ -681,12 +670,12 @@ void drawMultiLine(int y, int lineHeight, char* str){
 void setup() {
   // Pin setup
   pinMode(SOLENOID_PIN, OUTPUT);
-  pinMode(FLOW_PIN, INPUT);
+  pinMode(ACETONE_PIN, INPUT);
 
   // Start up libraries
   u8g2.begin();
   Serial.begin(9600);
-  Serial.println("TBLD Link - V1.0.2");
+  Serial.println("TBLD Link - V1.1.0");
 
   // Display boot screen for 5 secs
   u8g2.firstPage();
@@ -705,56 +694,25 @@ void loop() {
   // Before UI, poll pressures.
   int catPress = readPressure(CAT_PIN);
   int durPress = readPressure(DUR_PIN);
+  int acetoneValue = analogRead(ACETONE_PIN);
   avgCat = avgCat + catPress;
   avgDur = avgDur + durPress;
+  avgAce = avgAce + acetoneValue;
   numSamples = numSamples + 1;
 
-  // Read pulse length
-  bool currentState = digitalRead(FLOW_PIN);
-  unsigned long now = micros();
-  if (currentState == HIGH && lastState == LOW) {
-    pulseLowTime = now - lastChangeTime;
-    lastChangeTime = now;  // Update timestamp
-
-    // Increment count if LOW duration is valid
-    if (250000 < pulseLowTime && pulseLowTime < 350000) {
-      numPulses += 1;
-    } else {
-      if (numPulses > 0)
-        badOne += 1;
-      // allow for one intermediate spin that is out of the range
-      if (badOne > 1){
-        numPulses = 0; // Reset if two invalid spins detected
-        badOne = 0;
-      }
-    }
+  Serial.println("P" + String(acetoneValue));
+  
+  // Engage Acetone Failsafe
+  if (acetoneValue > 850){
+    engageTime = millis();
+    error = 8;
   }
 
-  // Detect falling edge (HIGH -> LOW) → Measure HIGH duration
-  if (currentState == LOW && lastState == HIGH) {
-    pulseHighTime = now - lastChangeTime;
-    lastChangeTime = now;  // Update timestamp
-
-    // Increment count if HIGH duration is valid
-    if (250000 < pulseHighTime && pulseHighTime < 350000) {
-      numPulses += 1;
-    } else {
-      if (numPulses > 0)
-        badOne += 1;
-      // allow for one intermediate spin that is out of the range
-      if (badOne > 1){
-        numPulses = 0; // Reset if two invalid spins detected
-        badOne = 0;
-      }
-    }
-  }
-  lastState = currentState;  // Update state for next loop iteration
-
-  // Run Failsafes
+  // Run Cat/Dur Failsafes
   bypassUpdate(catPress, durPress); // Update status into/out of bypass mode; clear error when moving into
   // Failsafe checks + display
   // This is checked and displayed first, so that the pressures move out of the way
-  checkErrors(catPress, durPress);
+  //checkErrors(catPress, durPress);
   // Engage failsafes, if necessary
   errorEngage();
 
@@ -765,10 +723,15 @@ void loop() {
     // Display the average values for both the pressures since the last frame, rounded to the nearest 25 psi.
     avgCat = round(avgCat/numSamples / 25.0) * 25;
     avgDur = round(avgDur/numSamples / 25.0) * 25;
+    avgAce = round(avgAce/numSamples);
     String catPressString = String(avgCat);
     String durPressString = String(avgDur);
     const char* catPressStr = catPressString.c_str();
     const char* durPressStr = durPressString.c_str();
+
+    // Output reading from acetone transducer
+   // Serial.println("A" + String(avgAce));
+    
     //Start paging for UI Display
     u8g2.firstPage();
     do {
@@ -778,20 +741,34 @@ void loop() {
         // Failsafe prints
         u8g2.setFont(u8g2_font_fur11_tr);
         drawMultiLine(80, 13, messages[error-1]);
+        // Add the countdown line
+        if (error == 8){
+          timeDelta = millis() - engageTime; 
+          unsigned long remaining = (error8Time-timeDelta)/1000;
+          char temp[50];  // Make sure the buffer is large enough
+          if (remaining < 1000){
+            snprintf(temp, sizeof(temp), "Pump will restart in %lu seconds.", remaining);
+          } else {
+            snprintf(temp, sizeof(temp), "You can now pressurize");
+          }
+          u8g2.drawStr(12, 120, temp);  // Draw the final line
+        }
+
+        // Print Graphics
         int centre = (120 - 32);
         if (error == 1) {
-          u8g2.drawXBMP(centre, 6, 64, 64, purgePin_bits);
+          u8g2.drawXBMP(centre, 2, 64, 64, purgePin_bits);
         } else if (error == 2) {
-          u8g2.drawXBMP(centre, 6, 64, 64, qr_debris);
+          u8g2.drawXBMP(centre, 2, 64, 64, qr_debris);
         } else if (error == 3) {
-          u8g2.drawXBMP(centre, 6, 64, 64, qr_durflat);
+          u8g2.drawXBMP(centre, 2, 64, 64, qr_durflat);
         } else if (error == 4) {
-          u8g2.drawXBMP(centre, 6, 64, 64, qr_pressure);
+          u8g2.drawXBMP(centre, 2, 64, 64, qr_pressure);
         } else if (error == 7) {
-          u8g2.drawXBMP(centre, 6, 64, 64, qr_catsupply);
+          u8g2.drawXBMP(centre, 2, 64, 64, qr_catsupply);
         } else {
           u8g2.setFont(u8g2_font_open_iconic_check_8x_t);  // Set the font to the symbol font
-          u8g2.drawGlyph(centre, 70, 66);
+          u8g2.drawGlyph(centre, 66, 66);
         }
       } else {
         // No offset from centre
@@ -836,6 +813,7 @@ void loop() {
     // Reset averages
     avgCat = 0;
     avgDur = 0;
+    avgAce = 0;
     numSamples = 0;
   }
 }
